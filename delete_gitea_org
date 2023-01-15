@@ -1,0 +1,109 @@
+#!/bin/bash
+
+#
+# Script to completely delete an organization with all its repos on a Gitea instance.
+#
+# Heavily inspired by:
+#   https://github.com/juergenhoetzel/github2gitea-mirror
+# 
+
+# ENVs:
+#   ACCESS_TOKEN = Gitea token
+#   GITERA_URL   = Gitea URL
+
+# Displays the given input including "=> " on the console.
+log () {
+	echo "=> $1"
+}
+
+CURL="curl -f -S -s"
+
+# Check for correctly set ENVs
+# ACCESS_TOKEN and GITEA_URL are always necessary
+if [[ -z "${ACCESS_TOKEN}" || -z "${GITEA_URL}" ]]; then
+    echo -e "Please set the Gitea access token and URL in environment:\nexport ACCESS_TOKEN=abc\nexport GITEA_URL=http://gitea:3000\n" >&2
+    echo -e "Don't use a trailing slash in URL!"
+    exit 1
+fi
+
+# Parse input arguments
+if [[ -z "$1" ]]; then
+	log "No parameter(s) given. Exit."
+    exit 1
+fi
+while [[ "$#" -gt 0 ]]; do
+	case $1 in
+		-o|--org) gitea_organization="$2"; shift ;;
+		*) log "Unknown parameter passed: $1"; exit 1 ;;
+	esac
+	shift
+done
+
+# Prints a message on how to use the script with exit 1
+fail_print_usage () {
+    echo -e "Usage: $0"
+    echo -e "   -o, --org \$organization             GitHub organization to mirror and/or the target organization in Gitea."
+    echo "" >&2
+    exit 1;
+}
+
+if [[ -z "${gitea_organization}" ]]; then
+    echo -e "Organization not set."
+    fail_print_usage
+fi
+
+# TODO:
+#set -euo pipefail
+set -eu pipefail
+
+header_options=(-H  "Authorization: Bearer ${ACCESS_TOKEN}" -H "accept: application/json" -H "Content-Type: application/json")
+jsonoutput=$(mktemp -d -t github-repos-XXXXXXXX)
+
+trap "rm -rf ${jsonoutput}" EXIT
+
+# Fetches all public/private repos of the given Gitea organization to '1.json'
+fetch_orga_repos() {
+    log "Fetch organization repos."
+    if ! $CURL -X GET $GITEA_URL/api/v1/orgs/${gitea_organization}/repos "${header_options[@]}" >${jsonoutput}/1.json 2>${jsonoutput}/stderr.txt; then
+        local code=$(<${jsonoutput}/result.txt)
+        if (( code != 404 ));then # 404 == orga not found
+            cat ${jsonoutput}/stderr.txt >&2
+        fi
+    fi
+}
+
+delete_orga_repos() {
+    log "Delete orga repos."
+    for f in ${jsonoutput}/1.json; do
+        n=$(jq '. | length'<$f)
+        if [[ "${n}" -gt "0" ]]; then
+            (( n-- )) # last element
+        else
+            break;
+        fi
+        echo "Deleting $n repos."
+        for i in $(seq 0 $n); do
+            del_user=$(jq -r ".[$i] | .owner.username" <$f)
+            del_repo=$(jq -r ".[$i] | .name " <$f)
+            echo "Deleting repo: $del_user/$del_repo"
+            $CURL -X DELETE $GITEA_URL/api/v1/repos/${del_user}/${del_repo} "${header_options[@]}" > ${jsonoutput}/result.txt 2>${jsonoutput}/stderr.txt
+        done
+    done
+}
+
+delete_orga() {
+    log "Delete orga."
+    if ! $CURL -X DELETE $GITEA_URL/api/v1/orgs/${gitea_organization} "${header_options[@]}" > ${jsonoutput}/result.txt 2>${jsonoutput}/stderr.txt; then
+        local code=$(<${jsonoutput}/result.txt)
+        if (( code != 404 ));then # 404 == orga not found
+            cat ${jsonoutput}/stderr.txt >&2
+        fi
+    fi
+}
+
+# Actual run the script
+fetch_orga_repos
+delete_orga_repos
+delete_orga
+
+log "Finished."
