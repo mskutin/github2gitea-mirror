@@ -1,6 +1,6 @@
-# Mirror your starred GitHub repos to a Gitea organization
+# Mirror GitHub single repos/users/orgas/starred repos to a Gitea instance
 
-**Inspiration for these scripts** \
+**Inspiration for these scripts**
 - [Proposal: Mirror an entire github organization into gitea organization](https://github.com/go-gitea/gitea/issues/8424)
 - This is a fork of [juergenhoetzel/github2gitea-mirror](https://github.com/juergenhoetzel/github2gitea-mirror)
 - The deletion of an organization which still contains repositories is not possible, yet:
@@ -15,13 +15,13 @@ One is able to create mirrors for various GitHub entities and the other is capab
 ### Mirroring users, organizations, repos
 
 First, setup your environment variables like this:
-- `ACCESS_TOKEN` is a application access token of your Gitea instance (always needed).
+- `ACCESS_TOKEN` is an application access token of your Gitea instance (always needed).
 - `GITEA_URL` is the URL of your Gitea instance (without trailing slash!) (always needed).
 - `GITHUB_TOKEN` is a personal access token for your GitHub account. It is needed in case you want to access private repos of your account/an organization.
 
 ```bash
 export ACCESS_TOKEN=123
-export GITEA_URL=http://gitea.example.com
+export GITEA_URL=https://gitea.example.com
 export GITHUB_TOKEN=456
 ```
 
@@ -73,15 +73,15 @@ Mirror a complete GitHub user:
 ### Deleting Gitea organizations with all repositories
 
 First, setup your environment variables like this:
-- `ACCESS_TOKEN` is a application access token of your Gitea instance (always needed).
-- `GITEA_URL` is the URL of your Gitea instance (without trailing slash!) (always needed).
+- `ACCESS_TOKEN` is an application access token of your Gitea instance.
+- `GITEA_URL` is the URL of your Gitea instance (without trailing slash!).
 
 ```bash
 export ACCESS_TOKEN=123
-export GITEA_URL=http://gitea.example.com
+export GITEA_URL=https://gitea.example.com
 ```
 
-Use parameter `-o` to pass the Gitea organization to delete to the script.
+Use parameter `-o` to pass the Gitea organization which should get deleted to the script.
 
 #### Examples
 
