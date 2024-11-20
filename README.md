@@ -11,7 +11,7 @@
 
 To use this script you need to install `jq` package on your system.
 
-On Ubuntu 22 it can be done usinf this command:
+On Ubuntu 22 it can be done using this command:
 ```
 sudo apt install jq
 ```
