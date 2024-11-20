@@ -9,6 +9,13 @@
 
 ## Usage
 
+To use this script you need to install `jq` package on your system.
+
+On Ubuntu 22 it can be done usinf this command:
+```
+sudo apt install jq
+```
+
 Currently, there are two scripts in this repository.
 One is able to create mirrors for various GitHub entities and the other is capable of deleting an entire Gitea organization with all of its repositories.
 
