@@ -20,10 +20,38 @@
 
 # Displays the given input including "=> " on the console.
 log () {
-	echo "=> $1"
+    echo "=> $1"
 }
 
 CURL="curl -f -S -s"
+
+MAX_RETRIES=3
+RETRY_DELAY=7  # seconds
+
+INITIAL_RETRY_DELAY=7  # seconds
+MAX_RETRY_DELAY=60    # maximum delay between retries
+
+# Add this function near the top with other utility functions
+validate_url() {
+    local url="$1"
+    # Check if URL has protocol
+    if [[ ! "$url" =~ ^https?:// ]]; then
+        echo "Error: URL must start with http:// or https://" >&2
+        return 1
+    fi
+    
+    # Extract port if present
+    if [[ "$url" =~ :[0-9]+(/|$) ]]; then
+        local port=$(echo "$url" | sed -E 's/.*:([0-9]+).*/\1/')
+        if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+            echo "Error: Invalid port number: $port" >&2
+            return 1
+        fi
+    fi
+    
+    # Remove trailing slash
+    echo "${url%/}"
+}
 
 # Check for correctly set ENVs
 # ACCESS_TOKEN and GITEA_URL are always necessary
@@ -33,21 +61,32 @@ if [[ -z "${ACCESS_TOKEN}" || -z "${GITEA_URL}" ]]; then
     exit 1
 fi
 
+# Validate and clean GITEA_URL
+GITEA_URL=$(validate_url "$GITEA_URL") || exit 1
+log "Using Gitea URL: $GITEA_URL"
+
 # Parse input arguments
 if [[ -z "$1" ]]; then
-	log "No parameter(s) given. Exit."
+    log "No parameter(s) given. Exit."
     exit 1
 fi
 while [[ "$#" -gt 0 ]]; do
-	case $1 in
-		-m|--mode) mode="$2"; shift ;;
-		-o|--org) gitea_organization="$2"; shift ;;
+    case $1 in
+        -m|--mode) mode="$2"; shift ;;
+        -o|--org) gitea_organization="$2"; shift ;;
         -u|--user) github_user="$2"; shift ;;
         -v|--visibility) visibility="$2"; shift ;;
         -r|--repo) repo="$2"; shift ;;
-		*) log "Unknown parameter passed: $1"; exit 1 ;;
-	esac
-	shift
+        --migrate-issues) migrate_issues="true" ;;
+        --migrate-pull-requests) migrate_pull_requests="true" ;;
+        --migrate-releases) migrate_releases="true" ;;
+        --migrate-lfs) migrate_lfs="true" ;;
+        # --lfs-endpoint) lfs_endpoint="$2"; shift ;;
+        --migrate-labels) migrate_labels="true" ;;
+        --migrate-milestones) migrate_milestones="true" ;;
+        *) log "Unknown parameter passed: $1"; exit 1 ;;
+    esac
+    shift
 done
 
 # Prints a message on how to use the script with exit 1
@@ -58,6 +97,13 @@ fail_print_usage () {
     echo -e "   -u, --user \$github_user             GitHub user to gather the starred repositories from."
     echo -e "   -v, --visibility {public,private}   Visibility for the created Gitea organization."
     echo -e "   -r, --repo \$repo_url                GitHub URL of a single repo to create a mirror for."
+    echo -e "   --migrate-issues                    Migrate repository issues"
+    echo -e "   --migrate-pull-requests             Migrate pull requests"
+    echo -e "   --migrate-releases                  Migrate releases"
+    echo -e "   --migrate-lfs                       Migrate LFS objects"
+    echo -e "   --lfs-endpoint \$url                 Custom LFS endpoint URL"
+    echo -e "   --migrate-labels                    Migrate repository labels"
+    echo -e "   --migrate-milestones               Migrate repository milestones"
     echo "" >&2
     exit 1;
 }
@@ -121,22 +167,57 @@ set_uid_user() {
 fetch_starred_repos() {
     log "Fetch starred repos."
     i=1
-    # GitHub API just returns empty arrays instead of 404
-    while $CURL "https://api.github.com/users/${github_user}/starred?page=${i}&per_page=100" >${jsonoutput}/${i}.json \
-	    && (( $(jq <${jsonoutput}/${i}.json '. | length') > 0 )) ; do
-	    (( i++ ))
+    total_repos=0
+    while true; do
+        cmd="$CURL -w '\n%{http_code}' 'https://api.github.com/users/${github_user}/starred?page=${i}&per_page=100'"
+        response=$(retry_with_backoff "$cmd")
+        if [ $? -ne 0 ]; then
+            log "Failed to fetch page $i"
+            return 1
+        fi
+        
+        echo "$response" > "${jsonoutput}/${i}.json"
+        count=$(jq '. | length' < "${jsonoutput}/${i}.json")
+        total_repos=$((total_repos + count))
+        
+        if [ "$count" -lt 100 ]; then
+            break
+        fi
+        log "Fetched $total_repos repos so far..."
+        (( i++ ))
     done
+    log "Total repositories fetched: $total_repos"
 }
 
 # Fetches all public/private repos of the given GitHub organization to JSON files
 fetch_orga_repos() {
     log "Fetch organization repos."
+    log "Using GitHub API URL: https://api.github.com/orgs/${gitea_organization}/repos"
     i=1
     # GitHub API just returns empty arrays instead of 404
-    while $CURL "https://api.github.com/orgs/${gitea_organization}/repos?page=${i}&per_page=100" -u "username:${GITHUB_TOKEN}" >${jsonoutput}/${i}.json \
-	    && (( $(jq <${jsonoutput}/${i}.json '. | length') > 0 )) ; do
-	    (( i++ ))
+    while $CURL "https://api.github.com/orgs/${gitea_organization}/repos?page=${i}&per_page=100" \
+        -H "Accept: application/vnd.github.v3+json" \
+        -u "username:${GITHUB_TOKEN}" >${jsonoutput}/${i}.json \
+        && (( $(jq <${jsonoutput}/${i}.json '. | length') > 0 )) ; do
+        log "Fetched page $i"
+        (( i++ ))
     done
+
+    # Check if we got any repos
+    total_repos=0
+    for f in ${jsonoutput}/*.json; do
+        if [ -f "$f" ]; then
+            count=$(jq '. | length' < "$f")
+            total_repos=$((total_repos + count))
+        fi
+    done
+
+    if [ $total_repos -eq 0 ]; then
+        log "No repositories found in organization ${gitea_organization}"
+        return 1
+    fi
+    
+    log "Total repositories fetched: $total_repos"
 }
 
 # Fetches all public/private repos of the given GitHub user to JSON files
@@ -145,8 +226,8 @@ fetch_user_repos() {
     i=1
     # GitHub API just returns empty arrays instead of 404
     while $CURL "https://api.github.com/user/repos?affiliation=owner&page=${i}&per_page=100" -u "${github_user}:${GITHUB_TOKEN}" >${jsonoutput}/${i}.json \
-	    && (( $(jq <${jsonoutput}/${i}.json '. | length') > 0 )) ; do
-	    (( i++ ))
+        && (( $(jq <${jsonoutput}/${i}.json '. | length') > 0 )) ; do
+        (( i++ ))
     done
 }
 
@@ -200,7 +281,12 @@ repos_to_migration() {
                 .clone_addr=.clone_url | \
                 .description=.description[0:255] | \
                 .repo_name=.name | \
-                {uid,repo_name,clone_addr,description,mirror,private,auth_username,auth_password}" <$f)
+                .wiki=true | \
+                .issues=${migrate_issues:-false} | \
+                .pull_requests=${migrate_pull_requests:-false} | \
+                .releases=${migrate_releases:-false} | \
+                .lfs=${migrate_lfs:-false} | \
+                {uid,repo_name,clone_addr,description,mirror,private,auth_username,auth_password,wiki,issues,pull_requests,releases,lfs}" <$f)
             echo "Migrating repo" $(jq ".[$i] | .uid=${uid} | .name" <$f)
             echo $mig_data | create_migration_repo
         done
@@ -220,10 +306,67 @@ one_repo_to_migration() {
             .clone_addr=.clone_url | \
             .description=.description[0:255] | \
             .repo_name=.name | \
-            {repo_owner,repo_name,clone_addr,description,mirror,private,auth_username,auth_password}" <$f)
+            .wiki=true | \
+            .issues=${migrate_issues:-false} | \
+            .pull_requests=${migrate_pull_requests:-false} | \
+            .releases=${migrate_releases:-false} | \
+            .lfs=${migrate_lfs:-false} | \
+            if(\"${lfs_endpoint}\" != \"\") then .lfs_endpoint=\"${lfs_endpoint}\" else . end | \
+            {repo_owner,repo_name,clone_addr,description,mirror,private,auth_username,auth_password,wiki,issues,pull_requests,releases,lfs,lfs_endpoint}" <$f)
         echo "Migrating repo" $(jq ".name" <$f)
         echo $mig_data | create_migration_repo
     done
+}
+
+retry_with_backoff() {
+    local cmd="$1"
+    local retries=0
+    local success=false
+    local delay=$INITIAL_RETRY_DELAY
+
+    while [ $retries -lt $MAX_RETRIES ] && [ "$success" = false ]; do
+        if [ $retries -gt 0 ]; then
+            log "Retry attempt $retries, waiting ${delay} seconds..."
+            sleep $delay
+            # Exponential backoff with max cap
+            delay=$(( delay * 2 < MAX_RETRY_DELAY ? delay * 2 : MAX_RETRY_DELAY ))
+        fi
+
+        response=$($cmd)
+        status_code=$(echo "$response" | tail -n1)
+        response_body=$(echo "$response" | head -n -1)
+
+        case $status_code in
+            200|201)
+                success=true
+                echo "$response_body"
+                ;;
+            409|422)  # Already exists cases
+                success=true
+                echo "$response_body"
+                ;;
+            502|503|504)  # Retry on gateway errors
+                log "Received $status_code error"
+                retries=$((retries + 1))
+                ;;
+            429)  # Rate limit - wait longer
+                log "Rate limited, waiting longer..."
+                delay=$MAX_RETRY_DELAY
+                retries=$((retries + 1))
+                ;;
+            *)
+                # For other errors, show error and exit
+                log "Error: Received status code $status_code"
+                echo "$response_body" >&2
+                return 1
+                ;;
+        esac
+    done
+
+    if [ "$success" = false ]; then
+        log "Error: Failed after $MAX_RETRIES retries"
+        return 1
+    fi
 }
 
 # Actual run the script
@@ -231,7 +374,10 @@ if [ "${mode}" == "org" ]; then
     log "Mode = organization"
     fetch_orga_repos
     create_migration_orga ${visibility}
-    set_uid
+    if ! set_uid; then
+        log "Failed to get organization UID. Exiting."
+        exit 1
+    fi
     repos_to_migration
 elif [ "${mode}" == "repo" ]; then
     log "Mode = single repo"
